@@ -1,0 +1,12 @@
+egress_ip: 0.0.0.0
+vpc_id: vpc-0123456789abcdef0
+accounts:
+  - profile: central
+    role_arn: arn:aws:iam::123456789012:role/OrganizationAccountAccessRole
+    duration: 900
+  - profile: management
+    role_arn: arn:aws:iam::123456789012:role/OrganizationAccountAccessRole
+    duration: 900
+  - profile: regional
+    role_arn: arn:aws:iam::123456789012:role/OrganizationAccountAccessRole
+    duration: 900

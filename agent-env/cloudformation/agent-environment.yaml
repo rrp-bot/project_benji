@@ -1,0 +1,193 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Agent VM Isolation — per-session environment stack.
+  Paired proxy (Fargate) + agent (EC2 capacity provider) ECS tasks.
+
+Parameters:
+  EnvironmentId:
+    Type: String
+    Description: Unique environment identifier
+  EcsCluster:
+    Type: String
+    Description: ECS cluster ARN
+  SubnetId:
+    Type: String
+    Description: Subnet for task placement
+  ProxySecurityGroupId:
+    Type: String
+    Description: Security group for proxy task
+  AgentSecurityGroupId:
+    Type: String
+    Description: Security group for agent task
+  ProxyImageUri:
+    Type: String
+    Description: ECR URI for egress proxy image
+  AgentImageUri:
+    Type: String
+    Description: ECR URI for agent environment image
+  ProxyTaskRoleArn:
+    Type: String
+    Description: IAM role ARN for proxy task
+  AgentTaskRoleArn:
+    Type: String
+    Description: IAM role ARN for agent task
+  ExecutionRoleArn:
+    Type: String
+    Description: IAM execution role ARN for ECS tasks
+  ProxyCpu:
+    Type: String
+    Default: "512"
+  ProxyMemory:
+    Type: String
+    Default: "1024"
+  AgentCpu:
+    Type: String
+    Default: "2048"
+  AgentMemory:
+    Type: String
+    Default: "8192"
+  DeveloperIdentity:
+    Type: String
+    Default: unknown
+    Description: Tag identifying the developer who created this environment
+  SecretGithubTokenArn:
+    Type: String
+    Description: Secrets Manager ARN for GitHub token
+  SecretGcpSaJsonArn:
+    Type: String
+    Description: Secrets Manager ARN for GCP service account JSON
+  CapacityProviderName:
+    Type: String
+    Description: EC2 capacity provider name for agent tasks
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # Proxy Task Definition (Fargate)
+  # ---------------------------------------------------------------------------
+  ProxyTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "agent-proxy-${EnvironmentId}"
+      RequiresCompatibilities:
+        - FARGATE
+      NetworkMode: awsvpc
+      Cpu: !Ref ProxyCpu
+      Memory: !Ref ProxyMemory
+      ExecutionRoleArn: !Ref ExecutionRoleArn
+      TaskRoleArn: !Ref ProxyTaskRoleArn
+      ContainerDefinitions:
+        - Name: proxy
+          Image: !Ref ProxyImageUri
+          Essential: true
+          PortMappings:
+            - ContainerPort: 3128
+              Protocol: tcp
+          Secrets:
+            - Name: GITHUB_TOKEN
+              ValueFrom: !Ref SecretGithubTokenArn
+            - Name: GCP_SA_JSON
+              ValueFrom: !Ref SecretGcpSaJsonArn
+          HealthCheck:
+            Command:
+              - CMD
+              - /proxy
+              - --health-check
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 10
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: /ecs/agent-egress-proxy
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: !Ref EnvironmentId
+
+  # ---------------------------------------------------------------------------
+  # Proxy Service (Fargate)
+  # ---------------------------------------------------------------------------
+  ProxyService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: !Sub "agent-proxy-${EnvironmentId}"
+      Cluster: !Ref EcsCluster
+      TaskDefinition: !Ref ProxyTaskDefinition
+      DesiredCount: 1
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets:
+            - !Ref SubnetId
+          SecurityGroups:
+            - !Ref ProxySecurityGroupId
+          AssignPublicIp: ENABLED
+      EnableExecuteCommand: true
+
+  # ---------------------------------------------------------------------------
+  # Agent Task Definition (EC2 capacity provider, privileged)
+  # ---------------------------------------------------------------------------
+  AgentTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "agent-env-${EnvironmentId}"
+      RequiresCompatibilities:
+        - EC2
+      NetworkMode: awsvpc
+      Cpu: !Ref AgentCpu
+      Memory: !Ref AgentMemory
+      ExecutionRoleArn: !Ref ExecutionRoleArn
+      TaskRoleArn: !Ref AgentTaskRoleArn
+      ContainerDefinitions:
+        - Name: agent
+          Image: !Ref AgentImageUri
+          Essential: true
+          Privileged: true
+          User: "agent"
+          LinuxParameters:
+            InitProcessEnabled: true
+          Environment:
+            - Name: HTTPS_PROXY
+              Value: ""
+            - Name: HTTP_PROXY
+              Value: ""
+            - Name: ENVIRONMENT_ID
+              Value: !Ref EnvironmentId
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: /ecs/agent-env
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: !Ref EnvironmentId
+
+  # ---------------------------------------------------------------------------
+  # Agent Service (EC2 capacity provider)
+  # ---------------------------------------------------------------------------
+  AgentService:
+    Type: AWS::ECS::Service
+    DependsOn: ProxyService
+    Properties:
+      ServiceName: !Sub "agent-env-${EnvironmentId}"
+      Cluster: !Ref EcsCluster
+      TaskDefinition: !Ref AgentTaskDefinition
+      DesiredCount: 1
+      CapacityProviderStrategy:
+        - CapacityProvider: !Ref CapacityProviderName
+          Weight: 1
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets:
+            - !Ref SubnetId
+          SecurityGroups:
+            - !Ref AgentSecurityGroupId
+      EnableExecuteCommand: true
+      Tags:
+        - Key: DeveloperIdentity
+          Value: !Ref DeveloperIdentity
+
+Outputs:
+  ProxyServiceName:
+    Value: !GetAtt ProxyService.Name
+  AgentServiceName:
+    Value: !GetAtt AgentService.Name
+  EnvironmentId:
+    Value: !Ref EnvironmentId

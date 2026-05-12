@@ -1,0 +1,806 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Agent VM Isolation — shared infrastructure (deployed once per region).
+  VPC, ECS cluster, EC2 capacity provider, ECR repositories, Secrets Manager,
+  security groups, IAM roles, API Gateway, and provisioning Lambda.
+
+Parameters:
+  VpcCidr:
+    Type: String
+    Default: "10.99.0.0/16"
+  PublicSubnetCidr:
+    Type: String
+    Default: "10.99.1.0/24"
+  AgentInstanceType:
+    Type: String
+    Default: m5.xlarge
+    Description: EC2 instance type for agent tasks (needs enough CPU/RAM for Claude CLI + podman)
+  EcsAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ecs/optimized-ami/amazon-linux-2023/recommended/image_id
+    Description: ECS-optimized AMI from SSM parameter store
+  LambdaS3Bucket:
+    Type: String
+    Default: ""
+    Description: S3 bucket containing provisioner Lambda zip (leave empty for placeholder)
+  LambdaS3Key:
+    Type: String
+    Default: ""
+    Description: S3 key for provisioner Lambda zip (leave empty for placeholder)
+
+Conditions:
+  HasLambdaCode: !Not [!Equals [!Ref LambdaS3Bucket, ""]]
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # Networking
+  # ---------------------------------------------------------------------------
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: agent-vm-isolation
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PublicSubnetCidr
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: agent-public
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: "0.0.0.0/0"
+      GatewayId: !Ref InternetGateway
+
+  SubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  # ---------------------------------------------------------------------------
+  # Security Groups
+  # ---------------------------------------------------------------------------
+  ProxySecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Egress proxy - inbound from agent tasks only
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: agent-proxy-sg
+
+  AgentSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Agent tasks - egress to proxy and AWS APIs only
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: agent-task-sg
+
+  ProxyIngressFromAgent:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref ProxySecurityGroup
+      IpProtocol: tcp
+      FromPort: 3128
+      ToPort: 3128
+      SourceSecurityGroupId: !Ref AgentSecurityGroup
+
+  ProxyEgressDnsUdp:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref ProxySecurityGroup
+      IpProtocol: udp
+      FromPort: 53
+      ToPort: 53
+      CidrIp: !Ref VpcCidr
+      Description: DNS resolution via VPC resolver
+
+  ProxyEgressDnsTcp:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref ProxySecurityGroup
+      IpProtocol: tcp
+      FromPort: 53
+      ToPort: 53
+      CidrIp: !Ref VpcCidr
+      Description: DNS resolution via VPC resolver (TCP fallback)
+
+  ProxyEgressHttps:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref ProxySecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      CidrIp: "0.0.0.0/0"
+
+  AgentEgressToProxy:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref AgentSecurityGroup
+      IpProtocol: tcp
+      FromPort: 3128
+      ToPort: 3128
+      DestinationSecurityGroupId: !Ref ProxySecurityGroup
+
+  AgentEgressDnsUdp:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref AgentSecurityGroup
+      IpProtocol: udp
+      FromPort: 53
+      ToPort: 53
+      CidrIp: !Ref VpcCidr
+      Description: DNS resolution via VPC resolver
+
+  AgentEgressDnsTcp:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref AgentSecurityGroup
+      IpProtocol: tcp
+      FromPort: 53
+      ToPort: 53
+      CidrIp: !Ref VpcCidr
+      Description: DNS resolution via VPC resolver (TCP fallback)
+
+  AgentEgressHttps:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref AgentSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      CidrIp: "0.0.0.0/0"
+      Description: AWS API endpoints (STS, ECS, etc.)
+
+  VpcEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: VPC endpoints for SSM
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref AgentSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref EC2InstanceSecurityGroup
+
+  SsmMessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.ssmmessages"
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PublicSubnet
+      SecurityGroupIds:
+        - !Ref VpcEndpointSecurityGroup
+
+  SsmEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.ssm"
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PublicSubnet
+      SecurityGroupIds:
+        - !Ref VpcEndpointSecurityGroup
+
+  S3Endpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.s3"
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref PublicRouteTable
+
+  EC2InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: EC2 host instance for ECS agent tasks
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: "0.0.0.0/0"
+      Tags:
+        - Key: Name
+          Value: agent-ec2-host-sg
+
+  # ---------------------------------------------------------------------------
+  # ECS Cluster
+  # ---------------------------------------------------------------------------
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: agent-vm-isolation
+      ClusterSettings:
+        - Name: containerInsights
+          Value: disabled
+      Configuration:
+        ExecuteCommandConfiguration:
+          Logging: NONE
+
+  CapacityProvider:
+    Type: AWS::ECS::CapacityProvider
+    Properties:
+      AutoScalingGroupProvider:
+        AutoScalingGroupArn: !Ref AgentAutoScalingGroup
+        ManagedScaling:
+          Status: DISABLED
+        ManagedTerminationProtection: DISABLED
+
+  ClusterCapacityAssociation:
+    Type: AWS::ECS::ClusterCapacityProviderAssociations
+    Properties:
+      Cluster: !Ref EcsCluster
+      CapacityProviders:
+        - !Ref CapacityProvider
+        - FARGATE
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: FARGATE
+          Weight: 1
+
+  # ---------------------------------------------------------------------------
+  # EC2 Instance for Agent Tasks (capacity provider)
+  # ---------------------------------------------------------------------------
+  EC2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EC2InstanceRole
+
+  AgentLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref EcsAmiId
+        InstanceType: !Ref AgentInstanceType
+        IamInstanceProfile:
+          Arn: !GetAtt EC2InstanceProfile.Arn
+        SecurityGroupIds:
+          - !Ref EC2InstanceSecurityGroup
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            echo ECS_CLUSTER=${EcsCluster} >> /etc/ecs/ecs.config
+            echo ECS_ENABLE_TASK_IAM_ROLE=true >> /etc/ecs/ecs.config
+            echo ECS_ENABLE_TASK_IAM_ROLE_NETWORK_HOST=true >> /etc/ecs/ecs.config
+            echo ECS_ENABLE_EXECUTE_COMMAND=true >> /etc/ecs/ecs.config
+            echo ECS_ENABLE_TASK_ENI=true >> /etc/ecs/ecs.config
+
+  AgentAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      MinSize: "1"
+      MaxSize: "1"
+      DesiredCapacity: "1"
+      LaunchTemplate:
+        LaunchTemplateId: !Ref AgentLaunchTemplate
+        Version: !GetAtt AgentLaunchTemplate.LatestVersionNumber
+      VPCZoneIdentifier:
+        - !Ref PublicSubnet
+      Tags:
+        - Key: Name
+          Value: agent-ecs-host
+          PropagateAtLaunch: true
+
+  # ---------------------------------------------------------------------------
+  # ECR Repositories are created by `agent-deploy.sh images-push` to avoid
+  # a circular dependency: the Lambda needs the container image to exist in
+  # ECR at stack-creation time, but the ECR repo would be created by the
+  # same stack.
+
+  # ---------------------------------------------------------------------------
+  # Secrets Manager
+  # ---------------------------------------------------------------------------
+  SecretCentralAccessKey:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: agent-ephemeral/central-access-key
+      Description: Central account AWS access key
+      SecretString: "PLACEHOLDER"
+
+  SecretCentralSecretKey:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: agent-ephemeral/central-secret-key
+      Description: Central account AWS secret key
+      SecretString: "PLACEHOLDER"
+
+  SecretCentralAssumeRoleArn:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: agent-ephemeral/central-assume-role-arn
+      Description: ARN of the role to assume in the central account
+      SecretString: "PLACEHOLDER"
+
+  SecretRegionalAccessKey:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: agent-ephemeral/regional-access-key
+      Description: Regional account AWS access key
+      SecretString: "PLACEHOLDER"
+
+  SecretRegionalSecretKey:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: agent-ephemeral/regional-secret-key
+      Description: Regional account AWS secret key
+      SecretString: "PLACEHOLDER"
+
+  SecretManagementAccessKey:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: agent-ephemeral/management-access-key
+      Description: Management account AWS access key
+      SecretString: "PLACEHOLDER"
+
+  SecretManagementSecretKey:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: agent-ephemeral/management-secret-key
+      Description: Management account AWS secret key
+      SecretString: "PLACEHOLDER"
+
+  SecretGithubToken:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: agent-proxy/github-token
+      Description: GitHub PAT for proxy header injection
+      SecretString: "PLACEHOLDER"
+
+  SecretGcpSaJson:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: agent-proxy/gcp-sa-json
+      Description: Google service account JSON for Vertex AI OAuth2
+      SecretString: "PLACEHOLDER"
+
+  # ---------------------------------------------------------------------------
+  # IAM — Proxy Task Role
+  # ---------------------------------------------------------------------------
+  ProxyTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: agent-proxy-task-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: proxy-secrets-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref SecretGithubToken
+                  - !Ref SecretGcpSaJson
+
+  # ---------------------------------------------------------------------------
+  # IAM — Agent Task Role (minimal — ECS Exec only)
+  # ---------------------------------------------------------------------------
+  AgentTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: agent-task-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ecs-exec
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssmmessages:CreateControlChannel
+                  - ssmmessages:CreateDataChannel
+                  - ssmmessages:OpenControlChannel
+                  - ssmmessages:OpenDataChannel
+                Resource: "*"
+
+  # ---------------------------------------------------------------------------
+  # IAM — ECS Task Execution Role (shared, for pulling images + secrets)
+  # ---------------------------------------------------------------------------
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: agent-task-execution-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: secrets-for-proxy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref SecretGithubToken
+                  - !Ref SecretGcpSaJson
+
+  # ---------------------------------------------------------------------------
+  # IAM — Provisioning Lambda Role
+  # ---------------------------------------------------------------------------
+  ProvisioningLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: agent-provisioning-lambda-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: provisioning-permissions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: SecretsAccess
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref SecretCentralAccessKey
+                  - !Ref SecretCentralSecretKey
+                  - !Ref SecretCentralAssumeRoleArn
+                  - !Ref SecretRegionalAccessKey
+                  - !Ref SecretRegionalSecretKey
+                  - !Ref SecretManagementAccessKey
+                  - !Ref SecretManagementSecretKey
+              - Sid: SSMParameters
+                Effect: Allow
+                Action: ssm:GetParameter
+                Resource:
+                  - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/agent-env/*"
+              - Sid: CloudFormation
+                Effect: Allow
+                Action:
+                  - cloudformation:CreateStack
+                  - cloudformation:DeleteStack
+                  - cloudformation:DescribeStacks
+                Resource:
+                  - !Sub "arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/agent-env-*/*"
+                  - !Sub "arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/agent-shared-infra/*"
+              - Sid: CloudFormationList
+                Effect: Allow
+                Action:
+                  - cloudformation:ListStacks
+                Resource: "*"
+              - Sid: ECSClusterScoped
+                Effect: Allow
+                Action:
+                  - ecs:RunTask
+                  - ecs:StopTask
+                  - ecs:DescribeTasks
+                  - ecs:ListTasks
+                  - ecs:ExecuteCommand
+                  - ecs:CreateService
+                  - ecs:UpdateService
+                  - ecs:DeleteService
+                  - ecs:DescribeServices
+                Resource: "*"
+                Condition:
+                  ArnEquals:
+                    "ecs:cluster": !GetAtt EcsCluster.Arn
+              - Sid: ECSGlobal
+                Effect: Allow
+                Action:
+                  - ecs:RegisterTaskDefinition
+                  - ecs:DeregisterTaskDefinition
+                  - ecs:DescribeTaskDefinition
+                  - ecs:ListContainerInstances
+                  - ecs:DescribeContainerInstances
+                  - ecs:TagResource
+                Resource: "*"
+              - Sid: EC2Describe
+                Effect: Allow
+                Action:
+                  - ec2:DescribeNetworkInterfaces
+                  - ec2:DescribeInstances
+                Resource: "*"
+              - Sid: Logs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:DescribeLogGroups
+                  - logs:DeleteLogGroup
+                  - logs:PutRetentionPolicy
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/ecs/agent-*"
+              - Sid: STS
+                Effect: Allow
+                Action:
+                  - sts:AssumeRole
+                  - sts:GetSessionToken
+                Resource: "*"
+              - Sid: PassRole
+                Effect: Allow
+                Action: iam:PassRole
+                Resource:
+                  - !GetAtt ProxyTaskRole.Arn
+                  - !GetAtt AgentTaskRole.Arn
+                  - !GetAtt TaskExecutionRole.Arn
+
+  # ---------------------------------------------------------------------------
+  # API Gateway
+  # ---------------------------------------------------------------------------
+  ApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: agent-provisioning-api
+      Description: Agent environment provisioning API
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  EnvironmentsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: environments
+
+  EnvironmentIdResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !Ref EnvironmentsResource
+      PathPart: "{id}"
+
+  ProvisionResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !Ref EnvironmentIdResource
+      PathPart: provision
+
+  RefreshResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !Ref EnvironmentIdResource
+      PathPart: refresh
+
+  PostEnvironments:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref EnvironmentsResource
+      HttpMethod: POST
+      AuthorizationType: AWS_IAM
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ProvisioningLambda.Arn}/invocations"
+
+  GetEnvironments:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref EnvironmentsResource
+      HttpMethod: GET
+      AuthorizationType: AWS_IAM
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ProvisioningLambda.Arn}/invocations"
+
+  GetEnvironment:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref EnvironmentIdResource
+      HttpMethod: GET
+      AuthorizationType: AWS_IAM
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ProvisioningLambda.Arn}/invocations"
+
+  DeleteEnvironment:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref EnvironmentIdResource
+      HttpMethod: DELETE
+      AuthorizationType: AWS_IAM
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ProvisioningLambda.Arn}/invocations"
+
+  PostProvision:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref ProvisionResource
+      HttpMethod: POST
+      AuthorizationType: AWS_IAM
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ProvisioningLambda.Arn}/invocations"
+
+  PostRefresh:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref RefreshResource
+      HttpMethod: POST
+      AuthorizationType: AWS_IAM
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ProvisioningLambda.Arn}/invocations"
+
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - PostEnvironments
+      - GetEnvironments
+      - GetEnvironment
+      - DeleteEnvironment
+      - PostProvision
+      - PostRefresh
+    Properties:
+      RestApiId: !Ref ApiGateway
+      Description: "v3 - added provision endpoint"
+
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref ApiGateway
+      DeploymentId: !Ref ApiDeployment
+      StageName: v1
+
+  # ---------------------------------------------------------------------------
+  # Provisioning Lambda
+  # ---------------------------------------------------------------------------
+  ProvisioningLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: agent-provisioner
+      PackageType: Image
+      Code:
+        ImageUri: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/agent-provisioner:latest"
+      Role: !GetAtt ProvisioningLambdaRole.Arn
+      Timeout: 900
+      MemorySize: 256
+      Environment:
+        Variables:
+          ECS_CLUSTER: !Ref EcsCluster
+          PROXY_SG_ID: !Ref ProxySecurityGroup
+          AGENT_SG_ID: !Ref AgentSecurityGroup
+          SUBNET_ID: !Ref PublicSubnet
+          PROXY_ECR_URI: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/agent-egress-proxy"
+          AGENT_ECR_URI: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/agent-env"
+          PROXY_TASK_ROLE_ARN: !GetAtt ProxyTaskRole.Arn
+          AGENT_TASK_ROLE_ARN: !GetAtt AgentTaskRole.Arn
+          EXECUTION_ROLE_ARN: !GetAtt TaskExecutionRole.Arn
+
+  LambdaApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ProvisioningLambda
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*"
+
+  # ---------------------------------------------------------------------------
+  # CloudWatch Log Groups
+  # ---------------------------------------------------------------------------
+  ProxyLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /ecs/agent-egress-proxy
+      RetentionInDays: 30
+
+  AgentLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /ecs/agent-env
+      RetentionInDays: 30
+
+Outputs:
+  EcsClusterArn:
+    Value: !GetAtt EcsCluster.Arn
+  EcsClusterName:
+    Value: !Ref EcsCluster
+  CapacityProviderName:
+    Value: !Ref CapacityProvider
+  AgentEcrUri:
+    Value: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/agent-env"
+  ProxyEcrUri:
+    Value: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/agent-egress-proxy"
+  VpcId:
+    Value: !Ref Vpc
+  PublicSubnetId:
+    Value: !Ref PublicSubnet
+  ProxySecurityGroupId:
+    Value: !Ref ProxySecurityGroup
+  AgentSecurityGroupId:
+    Value: !Ref AgentSecurityGroup
+  ApiGatewayUrl:
+    Value: !Sub "https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/v1"
+  ProxyTaskRoleArn:
+    Value: !GetAtt ProxyTaskRole.Arn
+  AgentTaskRoleArn:
+    Value: !GetAtt AgentTaskRole.Arn
+  TaskExecutionRoleArn:
+    Value: !GetAtt TaskExecutionRole.Arn
+  ProvisioningLambdaArn:
+    Value: !GetAtt ProvisioningLambda.Arn
+  ProvisionerEcrUri:
+    Value: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/agent-provisioner"
+  SecretGithubTokenArn:
+    Value: !Ref SecretGithubToken
+  SecretGcpSaJsonArn:
+    Value: !Ref SecretGcpSaJson

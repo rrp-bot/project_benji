@@ -1,0 +1,7 @@
+# Agent environment variables injected into .bashrc during provisioning
+# Copy to env-vars.txt and update values. Upload with: make env-config
+export CLAUDE_CODE_SKIP_VERTEX_AUTH=1
+export CLOUD_ML_REGION=global
+export ANTHROPIC_VERTEX_PROJECT_ID=your-gcp-project-id
+export CLAUDE_CODE_USE_VERTEX=1
+export GITHUB_TOKEN=dummy

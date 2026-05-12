@@ -1,0 +1,244 @@
+openapi: "3.1.0"
+info:
+  title: Agent Egress Proxy
+  version: "3.0.0"
+  description: |
+    TLS-terminating MITM forward proxy for LLM agent credential isolation.
+    Deployed as a per-session ECS Fargate task, paired with an agent task.
+    Handles CONNECT tunnels and injects authentication headers based on destination domain.
+    Reads credentials from AWS Secrets Manager via ECS native secrets integration.
+
+# This is not a REST API — the proxy handles HTTP CONNECT tunnels.
+# The OpenAPI spec documents the proxy's configuration, behavior, and logging contract.
+
+x-deployment:
+  platform: "ECS Fargate"
+  image_registry: "ECR"
+  service_type: "per-session, paired with agent task"
+  infrastructure: "CloudFormation stack (per-session environment stack)"
+  networking:
+    description: |
+      The proxy runs as an ECS Fargate task in the same VPC/subnet as the paired agent task.
+      Both tasks use awsvpc networking. A security group restricts inbound connections
+      to the paired agent task's security group only. Each session gets its own
+      proxy + agent pair in a dedicated CloudFormation stack.
+    security_group:
+      inbound:
+        - protocol: "TCP"
+          port: 3128
+          source: "agent-task-security-group"
+      outbound:
+        - protocol: "TCP"
+          port: 443
+          destination: "0.0.0.0/0"
+          description: "HTTPS to GitHub, Google APIs"
+
+x-proxy-behavior:
+  startup:
+    description: |
+      On startup, the proxy:
+      1. Generates a self-signed CA certificate and key (in-memory)
+      2. Makes the CA cert available for injection into the paired agent task
+         (the provisioning Lambda retrieves it via ECS Exec and injects it into the agent's trust store)
+      3. Reads the GitHub token from GITHUB_TOKEN env var (injected by ECS from Secrets Manager)
+      4. Reads the Google service account JSON from GCP_SA_JSON env var (injected by ECS from Secrets Manager)
+      5. Pre-fetches an initial Google OAuth2 access token using golang.org/x/oauth2/google
+      6. Begins listening on the configured bind address for CONNECT requests
+    ca_certificate:
+      generation: "at startup, self-signed, 1 year validity"
+      storage: "in-memory within the container; CA cert written to a known path for retrieval"
+      private_key: "in-memory only within the container, never persisted externally"
+      distribution: "Provisioning Lambda retrieves CA cert from proxy task via ECS Exec and injects into agent task trust store via ECS Exec"
+
+  connect_handling:
+    description: |
+      When the proxy receives a CONNECT request:
+      1. Extract the destination host from the CONNECT target (host:port)
+      2. Source IP restriction is enforced by the ECS security group (not application-level)
+      3. Check the destination host against the domain allowlist — reject with 403 if not allowed
+      4. Respond with 200 Connection Established
+      5. Generate a TLS certificate for the destination domain, signed by the proxy's CA
+      6. Perform TLS handshake with the client using the generated certificate
+      7. Establish a TLS connection to the real destination
+      8. For each request from the client:
+         a. Decrypt the request
+         b. Apply credential injection based on destination domain
+         c. Re-encrypt and forward to the destination
+         d. Relay the response back to the client
+         e. Log the request (see logging section)
+
+  credential_injection:
+    github:
+      domains:
+        - "github.com"
+        - "api.github.com"
+      method: "static token injection"
+      header: "Authorization: Bearer <GITHUB_TOKEN>"
+      behavior: |
+        Token is injected by ECS from Secrets Manager into GITHUB_TOKEN env var at task startup.
+        Injected into every request to matching domains.
+        If the request already has an Authorization header, it is replaced.
+    google:
+      domains:
+        - "*-aiplatform.googleapis.com"
+        - "oauth2.googleapis.com"
+      method: "OAuth2 token lifecycle"
+      header: "Authorization: Bearer <access_token>"
+      behavior: |
+        Service account JSON is injected by ECS from Secrets Manager into GCP_SA_JSON env var.
+        golang.org/x/oauth2/google handles the full lifecycle:
+        - JWT signing with the service account private key
+        - Token exchange via POST https://oauth2.googleapis.com/token
+        - In-memory caching (tokens valid for ~1 hour)
+        - Automatic refresh before expiry (library handles this)
+        The proxy does NOT make manual refresh calls — the oauth2 TokenSource
+        handles refresh transparently on each call to Token().
+      token_refresh_during_request: |
+        If a token refresh is needed during a request, the oauth2 library
+        handles it synchronously. Concurrent requests share the same TokenSource,
+        which is goroutine-safe — only one refresh occurs even under concurrent load.
+      token_refresh_failure: |
+        If token refresh fails (network error, invalid SA credentials):
+        - The proxy returns 502 Bad Gateway to the client
+        - The error is logged with the failure reason (but not credentials)
+        - Subsequent requests retry the token refresh (the library does not cache failures)
+
+  domain_allowlist:
+    rules:
+      - pattern: "github.com"
+        match_type: "exact"
+      - pattern: "api.github.com"
+        match_type: "exact"
+      - pattern: "*.googleapis.com"
+        match_type: "suffix"
+        description: "Matches any subdomain of googleapis.com (e.g., us-east1-aiplatform.googleapis.com, oauth2.googleapis.com)"
+    enforcement: "at CONNECT stage, before TLS handshake"
+    non_match_behavior:
+      http_status: 403
+      body: "Forbidden: destination not in allowlist"
+
+x-configuration:
+  description: |
+    All credential environment variables are injected by ECS from Secrets Manager
+    using the native secrets integration in the task definition. The proxy code
+    reads them as standard env vars — it does not call Secrets Manager directly.
+  environment_variables:
+    BIND_ADDR:
+      description: "Address and port to listen on"
+      default: "0.0.0.0:3128"
+      required: false
+    GITHUB_TOKEN:
+      description: "GitHub personal access token (injected by ECS from Secrets Manager)"
+      required: true
+      source: "arn:aws:secretsmanager:<region>:<account>:secret:agent-proxy/github-token"
+    GCP_SA_JSON:
+      description: "Google service account JSON string (injected by ECS from Secrets Manager)"
+      required: true
+      source: "arn:aws:secretsmanager:<region>:<account>:secret:agent-proxy/gcp-sa-json"
+    LOG_FORMAT:
+      description: "Log output format"
+      default: "json"
+      enum: ["json", "text"]
+      required: false
+
+x-ecs-task-definition:
+  description: "Key fields for the ECS Fargate task definition (per-session, in CloudFormation environment stack)"
+  task_role:
+    permissions: []
+    secrets_access:
+      - "arn:aws:secretsmanager:<region>:<account>:secret:agent-proxy/github-token"
+      - "arn:aws:secretsmanager:<region>:<account>:secret:agent-proxy/gcp-sa-json"
+  container:
+    image: "<account>.dkr.ecr.<region>.amazonaws.com/agent-egress-proxy:latest"
+    port_mappings:
+      - container_port: 3128
+        protocol: "tcp"
+    health_check:
+      command: ["CMD", "/proxy", "--health-check"]
+      interval: 30
+      timeout: 5
+      retries: 3
+    log_configuration:
+      log_driver: "awslogs"
+      options:
+        awslogs-group: "/ecs/agent-egress-proxy"
+        awslogs-region: "<region>"
+        awslogs-stream-prefix: "proxy"
+    secrets:
+      - name: "GITHUB_TOKEN"
+        value_from: "arn:aws:secretsmanager:<region>:<account>:secret:agent-proxy/github-token"
+      - name: "GCP_SA_JSON"
+        value_from: "arn:aws:secretsmanager:<region>:<account>:secret:agent-proxy/gcp-sa-json"
+
+x-logging:
+  format: "JSON lines to stdout (streamed to CloudWatch Logs via ECS awslogs driver)"
+  fields:
+    timestamp:
+      type: "string"
+      format: "RFC3339"
+      description: "When the request completed"
+    source_ip:
+      type: "string"
+      description: "Client IP address (agent task private IP within the VPC)"
+    destination:
+      type: "string"
+      description: "Target host:port from CONNECT"
+    method:
+      type: "string"
+      description: "HTTP method (GET, POST, etc.)"
+    path:
+      type: "string"
+      description: "Request path (e.g., /repos/org/repo)"
+    status:
+      type: "integer"
+      description: "HTTP response status code from upstream"
+    duration_ms:
+      type: "integer"
+      description: "Request duration in milliseconds"
+    credential_type:
+      type: "string"
+      enum: ["github", "google", "none"]
+      description: "Which credential was injected (never the value)"
+  redaction: |
+    The following are NEVER logged:
+    - Authorization header values
+    - Token values
+    - Service account JSON contents
+    - Request or response bodies
+  example: |
+    {"timestamp":"2026-04-24T10:15:30Z","source_ip":"10.0.1.42","destination":"api.github.com:443","method":"GET","path":"/repos/openshift-online/rosa-regional-platform","status":200,"duration_ms":42,"credential_type":"github"}
+
+x-error-responses:
+  connect_rejected_domain:
+    trigger: "CONNECT to non-allowlisted domain"
+    http_status: 403
+    body: "Forbidden: destination not in allowlist"
+    logged: true
+  upstream_tls_failure:
+    trigger: "Cannot establish TLS to upstream destination"
+    http_status: 502
+    body: "Bad Gateway: upstream TLS handshake failed"
+    logged: true
+  token_refresh_failure:
+    trigger: "Google OAuth2 token refresh fails"
+    http_status: 502
+    body: "Bad Gateway: credential refresh failed"
+    logged: true
+  missing_credentials:
+    trigger: "Required environment variables not set at startup"
+    action: "Exit with non-zero status and error message to stderr (ECS will restart the task)"
+
+x-health:
+  endpoint: "GET /healthz on BIND_ADDR"
+  description: |
+    Health check endpoint used by ECS task health checks.
+    Returns 200 if the proxy is running and has valid credentials.
+    Returns 503 if either credential check fails.
+    GitHub check: lightweight GET to https://api.github.com/rate_limit
+    Google check: verify OAuth2 token can be obtained from TokenSource
+  response_200:
+    body: '{"status":"ok","github_token_valid":true,"google_token_valid":true}'
+  response_503:
+    body: '{"status":"degraded","github_token_valid":false,"google_token_valid":false,"error":"<details>"}'
+
+paths: {}

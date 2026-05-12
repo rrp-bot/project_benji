@@ -1,0 +1,7 @@
+egress-proxy/egress-proxy
+agent_credentials
+*.env
+.terraform/
+.terraform.lock.hcl
+config/*
+!config/*.example

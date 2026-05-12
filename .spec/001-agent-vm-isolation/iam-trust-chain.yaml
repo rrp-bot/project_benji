@@ -1,0 +1,351 @@
+# AWS IAM Trust Chain for Agent VM Isolation
+#
+# Credential Flow:
+#   Secrets Manager (raw keys) → Provisioning Lambda → STS (IP-bound) → Agent ECS Task
+#
+# Three ephemeral accounts: Central, Regional, Management
+# All credentials on the agent task are IP-bound STS sessions — useless from any other IP.
+# The provisioning service (Lambda) is the sole credential minter.
+# All infrastructure is deployed as CloudFormation stacks.
+
+---
+credential_flow:
+  description: |
+    The provisioning service (API Gateway + Lambda, trusted deterministic code) performs:
+    1. Developer calls POST /environments (authenticated via their AWS IAM creds)
+    2. Service creates a per-session CloudFormation stack → proxy Fargate task + agent EC2 capacity provider task
+    3. Service waits for stack creation to complete and both tasks to reach RUNNING state
+    4. Service discovers the agent task's public IP from the task ENI (awsvpc networking assigns a public IP)
+    5. Service reads raw AWS credentials from Secrets Manager:
+       - central_access_key, central_secret_key, central_assume_role_arn
+       - regional_access_key, regional_secret_key
+       - management_access_key, management_secret_key
+    6. For each account (central, regional, management):
+       a. Create a session with the raw access key + secret key
+       b. For central: call sts:AssumeRole with the central_assume_role_arn,
+          adding an inline session policy with aws:SourceIp = <agent-task-public-IP>/32
+       c. For regional/management: call sts:GetSessionToken with an inline
+          session policy with aws:SourceIp = <agent-task-public-IP>/32
+       d. Inject the resulting STS credentials into the agent task via ECS Exec
+          (writes to /home/agent/.aws/credentials with named profiles)
+    7. Service retrieves the proxy's CA certificate via ECS Exec and injects it
+       into the agent task's trust store via ECS Exec
+    8. The raw Secrets Manager credentials never leave the provisioning Lambda
+
+  ip_discovery:
+    description: |
+      Agent tasks on the EC2 capacity provider do not get public IPs on task ENIs
+      (awsvpc on EC2 does not support assignPublicIp). Instead, outbound traffic
+      uses the EC2 host instance's networking — either its public IP (in a public
+      subnet) or the NAT gateway EIP (in a private subnet). The provisioning Lambda
+      discovers the egress IP by querying the EC2 instance's public IP from instance
+      metadata or CloudFormation stack outputs.
+    source: "EC2 host instance public IP or NAT gateway EIP (from CF stack outputs or ec2:DescribeInstances)"
+    when: "After task reaches RUNNING state, before minting STS sessions"
+    note: |
+      Since all agent tasks share the same EC2 host instance (single instance for PoC),
+      they share the same egress IP. This is acceptable for PoC but means IP-binding
+      does not isolate between concurrent sessions on the same host.
+
+  ip_binding_mechanism: |
+    AWS supports inline session policies on both AssumeRole and GetSessionToken.
+    The session policy is the intersection of the role/user policy and the inline policy.
+    By adding a Deny-all-except-SourceIp statement, the resulting credentials
+    cannot make any API call from an IP other than the agent task's public IP.
+
+  note_on_assume_role_chaining: |
+    The central account uses AssumeRole to access regional/management accounts.
+    When the agent calls sts:AssumeRole from the central IP-bound session,
+    the resulting regional/management session inherits the IP restriction because:
+    - The central session has a Deny policy for non-agent IPs
+    - AssumeRole evaluates the caller's session policies
+    - The chained session cannot exceed the permissions of the calling session
+    This means IP binding propagates through the AssumeRole chain automatically.
+
+  why_not_task_role: |
+    IAM task role credentials are available via the ECS credential endpoint
+    (169.254.170.2). The LLM has shell access and can curl this endpoint to
+    exfiltrate task role credentials. Task role credentials are temporary but
+    NOT IP-bound — they work from anywhere for their remaining TTL. The IP-bound
+    STS approach ensures that even if credentials are exfiltrated, they are
+    useless outside the agent task's network interface.
+
+---
+# Session policy applied to ALL accounts when creating IP-bound sessions.
+# This is passed as the --policy parameter to sts:GetSessionToken or sts:AssumeRole.
+# <AGENT-EGRESS-IP> is the public IP from the agent task's ENI.
+ip_restriction_session_policy:
+  Version: "2012-10-17"
+  Statement:
+    - Sid: "DenyFromNonAgentIP"
+      Effect: "Deny"
+      Action: "*"
+      Resource: "*"
+      Condition:
+        NotIpAddress:
+          "aws:SourceIp": "<AGENT-EGRESS-IP>/32"
+
+---
+# IAM Roles Overview
+#
+# Four distinct IAM roles in this architecture, all defined in CloudFormation:
+roles:
+  provisioning_service_role:
+    description: |
+      The IAM role for the provisioning Lambda (execution role).
+      This is the most privileged role — it reads raw secrets and creates STS sessions.
+      Defined in the shared infrastructure CloudFormation stack.
+    permissions:
+      - "secretsmanager:GetSecretValue (for raw AWS keys, GitHub token, GCP SA JSON)"
+      - "cloudformation:CreateStack, DeleteStack, DescribeStacks, ListStacks"
+      - "ecs:RunTask, StopTask, DescribeTasks, ListTasks, ExecuteCommand"
+      - "ec2:DescribeNetworkInterfaces (to discover agent task public IP from ENI)"
+      - "sts:AssumeRole (with raw central keys, to create IP-bound sessions)"
+      - "sts:GetSessionToken (with raw regional/management keys)"
+      - "iam:PassRole (to assign task roles to ECS tasks)"
+      - "logs:CreateLogGroup, CreateLogStream, PutLogEvents (Lambda logging)"
+
+  proxy_task_role:
+    description: |
+      The ECS task role for the egress proxy Fargate task.
+      Only needs Secrets Manager access for GitHub/GCP credentials.
+      Defined in the per-session environment CloudFormation stack.
+    permissions:
+      - "secretsmanager:GetSecretValue (for GitHub token and GCP SA JSON only)"
+
+  agent_task_role:
+    description: |
+      Minimal ECS task role for the agent task (EC2 capacity provider).
+      Only needed for ECS Exec support (so provisioning Lambda and developers can exec in).
+      Does NOT have ephemeral environment permissions — those come from IP-bound STS creds.
+      Defined in the per-session environment CloudFormation stack.
+    permissions:
+      - "ssmmessages:CreateControlChannel"
+      - "ssmmessages:CreateDataChannel"
+      - "ssmmessages:OpenControlChannel"
+      - "ssmmessages:OpenDataChannel"
+    note: "These are the minimum permissions for ECS Exec functionality."
+
+  developer_api_role:
+    description: |
+      The developer's own AWS IAM credentials used to authenticate to the provisioning API.
+      Needs permission to invoke the API Gateway endpoint.
+    permissions:
+      - "execute-api:Invoke on the provisioning API Gateway"
+
+---
+# Central Account
+#
+# Raw credentials stored in Secrets Manager.
+# The provisioning Lambda calls sts:AssumeRole with central_assume_role_arn,
+# passing ip_restriction_session_policy as the inline session policy.
+central_account:
+  secrets_manager_keys:
+    - "agent-ephemeral/central-access-key"
+    - "agent-ephemeral/central-secret-key"
+    - "agent-ephemeral/central-assume-role-arn"
+  required_actions:
+    sts:
+      actions:
+        - "sts:GetCallerIdentity"
+        - "sts:AssumeRole"
+      resource_note: |
+        AssumeRole is needed to assume OrganizationAccountAccessRole
+        in regional and management accounts.
+    codepipeline:
+      actions:
+        - "codepipeline:ListPipelines"
+        - "codepipeline:ListPipelineExecutions"
+        - "codepipeline:GetPipelineExecution"
+      resource_note: "Scoped to pipeline-provisioner pipeline matching ci_prefix"
+    logs:
+      actions:
+        - "logs:DescribeLogGroups"
+        - "logs:DescribeLogStreams"
+        - "logs:GetLogEvents"
+      resource_note: "Scoped to /aws/codebuild/{ci_prefix}-* log groups"
+    # IAM write permissions (iam:GetRole, iam:UpdateAssumeRolePolicy) are NOT
+    # included. Cross-account trust policies are pre-configured.
+
+  recommended_policy:
+    Version: "2012-10-17"
+    Statement:
+      - Sid: "AllowSTS"
+        Effect: "Allow"
+        Action:
+          - "sts:GetCallerIdentity"
+          - "sts:AssumeRole"
+        Resource:
+          - "arn:aws:iam::<regional-account-id>:role/OrganizationAccountAccessRole"
+          - "arn:aws:iam::<management-account-id>:role/OrganizationAccountAccessRole"
+      - Sid: "AllowCodePipeline"
+        Effect: "Allow"
+        Action:
+          - "codepipeline:ListPipelines"
+          - "codepipeline:ListPipelineExecutions"
+          - "codepipeline:GetPipelineExecution"
+        Resource: "*"
+      - Sid: "AllowCloudWatchLogs"
+        Effect: "Allow"
+        Action:
+          - "logs:DescribeLogGroups"
+          - "logs:DescribeLogStreams"
+          - "logs:GetLogEvents"
+        Resource:
+          - "arn:aws:logs:*:*:log-group:/aws/codebuild/<ci_prefix>-*"
+          - "arn:aws:logs:*:*:log-group:/aws/codebuild/<ci_prefix>-*:log-stream:*"
+
+---
+# Regional Account
+#
+# Raw credentials stored in Secrets Manager.
+# The provisioning Lambda calls sts:GetSessionToken with ip_restriction_session_policy.
+regional_account:
+  secrets_manager_keys:
+    - "agent-ephemeral/regional-access-key"
+    - "agent-ephemeral/regional-secret-key"
+  required_actions:
+    sts:
+      actions:
+        - "sts:GetCallerIdentity"
+    codepipeline:
+      actions:
+        - "codepipeline:ListPipelines"
+        - "codepipeline:ListPipelineExecutions"
+        - "codepipeline:GetPipelineExecution"
+      resource_note: "RC and MC pipelines matching {ci_prefix}-*"
+    logs:
+      actions:
+        - "logs:DescribeLogGroups"
+        - "logs:DescribeLogStreams"
+        - "logs:GetLogEvents"
+      resource_note: "CodeBuild logs from regional provisioning"
+    ecs:
+      actions:
+        - "ecs:ListTasks"
+        - "ecs:RunTask"
+        - "ecs:DescribeTasks"
+        - "ecs:ExecuteCommand"
+      resource_note: "Bastion tasks in {ci_prefix}-* clusters"
+    ec2:
+      actions:
+        - "ec2:DescribeSecurityGroups"
+        - "ec2:DescribeSubnets"
+      resource_note: "Lookup bastion networking (security group, VPC, subnets)"
+    ssm:
+      actions:
+        - "ssm:StartSession"
+      resource_note: "Port-forwarding sessions to bastion ECS tasks"
+
+---
+# Management Account
+#
+# Raw credentials stored in Secrets Manager.
+# The provisioning Lambda calls sts:GetSessionToken with ip_restriction_session_policy.
+management_account:
+  secrets_manager_keys:
+    - "agent-ephemeral/management-access-key"
+    - "agent-ephemeral/management-secret-key"
+  required_actions:
+    sts:
+      actions:
+        - "sts:GetCallerIdentity"
+    ecs:
+      actions:
+        - "ecs:ListTasks"
+        - "ecs:RunTask"
+        - "ecs:DescribeTasks"
+        - "ecs:ExecuteCommand"
+      resource_note: "Bastion tasks in {ci_prefix}-* MC clusters"
+    ec2:
+      actions:
+        - "ec2:DescribeSecurityGroups"
+        - "ec2:DescribeSubnets"
+      resource_note: "Lookup MC bastion networking"
+    ssm:
+      actions:
+        - "ssm:StartSession"
+      resource_note: "Port-forwarding sessions to MC bastion ECS tasks"
+
+---
+# Secrets Manager Layout
+secrets_manager:
+  description: |
+    All secrets are defined in the shared infrastructure CloudFormation stack
+    (initially empty, populated by the bootstrap script).
+  secrets:
+    - name: "agent-ephemeral/central-access-key"
+      description: "Central account AWS access key"
+      accessed_by: ["provisioning-lambda"]
+    - name: "agent-ephemeral/central-secret-key"
+      description: "Central account AWS secret key"
+      accessed_by: ["provisioning-lambda"]
+    - name: "agent-ephemeral/central-assume-role-arn"
+      description: "ARN of the role to assume in the central account"
+      accessed_by: ["provisioning-lambda"]
+    - name: "agent-ephemeral/regional-access-key"
+      description: "Regional account AWS access key"
+      accessed_by: ["provisioning-lambda"]
+    - name: "agent-ephemeral/regional-secret-key"
+      description: "Regional account AWS secret key"
+      accessed_by: ["provisioning-lambda"]
+    - name: "agent-ephemeral/management-access-key"
+      description: "Management account AWS access key"
+      accessed_by: ["provisioning-lambda"]
+    - name: "agent-ephemeral/management-secret-key"
+      description: "Management account AWS secret key"
+      accessed_by: ["provisioning-lambda"]
+    - name: "agent-proxy/github-token"
+      description: "GitHub PAT for proxy header injection"
+      accessed_by: ["proxy-ecs-task"]
+    - name: "agent-proxy/gcp-sa-json"
+      description: "Google service account JSON for Vertex AI OAuth2"
+      accessed_by: ["proxy-ecs-task"]
+
+---
+# AWS Credentials File on Agent Task
+#
+# Written by the provisioning Lambda via ECS Exec after creating IP-bound sessions.
+aws_credentials_file:
+  path: "/home/agent/.aws/credentials"
+  format: |
+    [central]
+    aws_access_key_id = <STS-access-key>
+    aws_secret_access_key = <STS-secret-key>
+    aws_session_token = <STS-session-token>
+
+    [regional]
+    aws_access_key_id = <STS-access-key>
+    aws_secret_access_key = <STS-secret-key>
+    aws_session_token = <STS-session-token>
+
+    [management]
+    aws_access_key_id = <STS-access-key>
+    aws_secret_access_key = <STS-secret-key>
+    aws_session_token = <STS-session-token>
+  note: |
+    All three profiles contain IP-bound STS credentials.
+    Session tokens expire after the configured duration (max 12 hours).
+    The provisioning Lambda can refresh credentials via ECS Exec
+    (POST /environments/{id}/refresh) without destroying the tasks.
+
+---
+# Verification Steps
+verification:
+  - step: "Confirm agent egress IP from EC2 host instance"
+    command: |
+      # The agent task runs on an EC2 capacity provider — its egress IP is the host instance's public IP
+      INSTANCE_ID=$(aws cloudformation describe-stacks --stack-name agent-shared-infra --query 'Stacks[0].Outputs[?OutputKey==`AgentEC2InstanceId`].OutputValue' --output text)
+      aws ec2 describe-instances --instance-ids $INSTANCE_ID --query 'Reservations[0].Instances[0].PublicIpAddress' --output text
+    expected: "Returns the egress IP used in the STS session policy"
+  - step: "ECS Exec into agent task, verify each profile"
+    command: "aws ecs execute-command --cluster <cluster> --task <task-arn> --container agent --interactive --command 'AWS_PROFILE=central aws sts get-caller-identity'"
+    expected: "Success — returns account ID and ARN"
+  - step: "From developer laptop, attempt to use the same credentials"
+    expected: "AccessDenied — credentials are IP-bound to the agent task's public IP"
+  - step: "From agent task, AssumeRole into regional account via central profile"
+    command: "AWS_PROFILE=central aws sts assume-role --role-arn <regional-org-role> --role-session-name test"
+    expected: "Success — IP restriction propagates through the chain"
+  - step: "From agent task, verify task role credentials cannot access ephemeral resources"
+    command: "curl -s http://169.254.170.2$AWS_CONTAINER_CREDENTIALS_RELATIVE_URI | jq .RoleArn"
+    expected: "Returns only the minimal ECS Exec task role, not ephemeral environment permissions"
