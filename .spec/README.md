@@ -7,7 +7,6 @@ This directory contains feature specifications and related artifacts for spec-dr
 Spec-driven development guides AI code generation through structured specifications, leading to more successful implementations. These artifacts help with feature iteration, understanding implementation decisions, and replicating similar work.
 
 ### No Maintenance
-
 Specs are point-in-time artifacts - they are not maintained or used in automation outside building features. Specs are not expected to be updated to reflect changes in a feature post-implementation.
 
 ## Getting Started
@@ -24,16 +23,14 @@ Specs are point-in-time artifacts - they are not maintained or used in automatio
 ## Usage
 
 ### Start a new feature specification:
-
 ```
 $ claude
 > /specify Add a new feature for user authentication
 ```
 
 ### Continue working on an existing feature:
-
 ```
-$ claude
+$ claude  
 > /specify continue to where we left off for the user authentication feature
 ```
 

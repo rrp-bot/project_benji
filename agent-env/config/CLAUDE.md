@@ -49,4 +49,4 @@ This environment is intended for use with the Claude SDK to implement autonomous
 
 ## Proxy Configuration
 
-The proxy is configured via environment variables (`HTTPS_PROXY`, `HTTP_PROXY`). The proxy CA certificate is installed in the system trust store. Do not modify proxy settings.
+The proxy is configured via environment variables (`HTTPS_PROXY`, `HTTP_PROXY`). The proxy CA certificate is installed in the system trust store at `/etc/pki/ca-trust/source/anchors/proxy-ca.crt`. If a tool or library requires an explicit CA bundle path, use this file. Do not modify proxy settings.
