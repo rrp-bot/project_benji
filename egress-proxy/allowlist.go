@@ -22,6 +22,9 @@ func defaultAllowlist() *allowlist {
 			"files.pythonhosted.org":    true,
 			"astral.sh":                 true,
 			"mirror.openshift.com":      true,
+			"keyserver.ubuntu.com":      true,
+			"keys.openpgp.org":          true,
+			"pgp.mit.edu":              true,
 		},
 		suffix: []string{
 			".googleapis.com",
