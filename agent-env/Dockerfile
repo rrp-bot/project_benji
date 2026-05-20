@@ -52,6 +52,8 @@ RUN chmod -R a+w /etc/pki/ca-trust
 COPY --chown=agent:agent config/CLAUDE.md /workspace/CLAUDE.md
 
 RUN echo 'export PS1="[agent@\h \W]\$ "' >> /home/agent/.bashrc && \
+    echo 'export AWS_CA_BUNDLE=/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem' >> /home/agent/.bashrc && \
+    echo 'export RRP_AWS_PROFILES_PRESET=1' >> /home/agent/.bashrc && \
     echo 'cd /workspace' >> /home/agent/.bashrc
 
 ENV HOME=/home/agent
