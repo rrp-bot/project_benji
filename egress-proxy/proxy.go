@@ -27,6 +27,7 @@ func (p *proxyHandler) handleConnect(w http.ResponseWriter, r *http.Request) {
 			Method:      "CONNECT",
 			Status:      http.StatusForbidden,
 		})
+		w.Header().Set("Connection", "close")
 		http.Error(w, "Forbidden: destination not in allowlist", http.StatusForbidden)
 		return
 	}

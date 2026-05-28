@@ -58,6 +58,10 @@ func TestConnectAllowlistReject(t *testing.T) {
 	if resp.StatusCode != http.StatusForbidden {
 		t.Errorf("status = %d, want 403", resp.StatusCode)
 	}
+	body, _ := io.ReadAll(resp.Body)
+	if len(body) == 0 {
+		t.Error("expected error body describing allowlist rejection")
+	}
 }
 
 func TestConnectAllowlistAllow(t *testing.T) {
