@@ -22,6 +22,10 @@ func defaultAllowlist() *allowlist {
 			"files.pythonhosted.org":    true,
 			"astral.sh":                 true,
 			"mirror.openshift.com":      true,
+			"proxy.golang.org":          true,
+			"sum.golang.org":            true,
+			"golang.org":                true,
+			"go.dev":                    true,
 			"keyserver.ubuntu.com":      true,
 			"keys.openpgp.org":          true,
 			"pgp.mit.edu":              true,
@@ -39,6 +43,7 @@ func defaultAllowlist() *allowlist {
 			".astral.sh",
 			".pypi.org",
 			".pythonhosted.org",
+			".cloudfront.net",
 		},
 	}
 }

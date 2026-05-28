@@ -35,6 +35,8 @@ func TestAllowlistSuffixMatch(t *testing.T) {
 		{"googleapis.com", false},
 		{"evil-googleapis.com", false},
 		{"notgoogleapis.com", false},
+		{"d2jevvnzzbv449.cloudfront.net", true},
+		{"cloudfront.net", false},
 	}
 
 	for _, tt := range tests {
