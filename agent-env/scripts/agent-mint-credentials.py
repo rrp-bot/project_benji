@@ -28,8 +28,9 @@ Usage:
     python3 agent-mint-credentials.py --ip 1.2.3.4 --config config/account_config.yaml \\
         --sandbox-name my-sandbox --sandbox-dir /sandbox/.aws
 
-    # SCP onto VM then upload into sandbox from the VM over SSH:
-    python3 agent-mint-credentials.py --ip 1.2.3.4 --config config/account_config.yaml \\
+    # SCP onto VM then upload into sandbox from the VM over SSH
+    # (egress IP auto-discovered from checkip.amazonaws.com):
+    python3 agent-mint-credentials.py --config config/account_config.yaml \\
         --ssh-host ec2-user@my-host --ssh-key ~/.ssh/id_ed25519 \\
         --sandbox-name my-sandbox --sandbox-dir /sandbox/.aws
 """
@@ -42,6 +43,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.request
 from datetime import datetime, timezone
 
 import boto3
@@ -119,6 +121,19 @@ def _discover_from_env(env_session: boto3.Session, env_id: str) -> tuple[str, st
     print(f"Discovered VPC ID:          {vpc_id}", file=sys.stderr)
 
     return egress_ip, vpc_id, cluster
+
+
+def _discover_local_egress_ip() -> str:
+    """Discover the public egress IP of the local machine via checkip.amazonaws.com."""
+    url = "https://checkip.amazonaws.com"
+    try:
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            ip = resp.read().decode().strip()
+    except Exception as exc:
+        print(f"ERROR: Could not determine local egress IP from {url}: {exc}", file=sys.stderr)
+        sys.exit(1)
+    print(f"Discovered local egress IP: {ip}", file=sys.stderr)
+    return ip
 
 
 def _inject_credentials(
@@ -541,16 +556,25 @@ All three can be combined with --keep-alive to continuously refresh credentials.
     env_session = boto3.Session()
 
     if args.env_id:
+        # Benji path: discover egress IP and VPC from live ECS infrastructure.
         ip, vpc_id, cluster = _discover_from_env(env_session, args.env_id)
     else:
         with open(args.config) as f:
             config = yaml.safe_load(f)
-        ip = args.ip or config.get("egress_ip")
         vpc_id = config.get("vpc_id")
         cluster = None
-        if not ip:
+
+        if args.ip:
+            ip = args.ip
+        elif config.get("egress_ip"):
+            ip = config["egress_ip"]
+        elif args.ssh_host or args.sandbox_name:
+            # SSH/sandbox path: auto-discover local egress IP via AWS checkip.
+            ip = _discover_local_egress_ip()
+        else:
             parser.error("No egress_ip in config and no --ip/--env-id flag provided")
-        if not vpc_id:
+
+        if not vpc_id and not (args.ssh_host or args.sandbox_name):
             parser.error("No vpc_id in config and no --env-id flag provided")
 
     while True:
