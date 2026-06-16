@@ -202,17 +202,20 @@ def _build_restriction_policy(ip: str, vpc_id: str | None = None) -> str:
                 "Null": {"aws:SourceIp": "false"},
             },
         },
-        {
-            "Sid": "DenyNonAgentVpc",
-            "Effect": "Deny",
-            "Action": "*",
-            "Resource": "*",
-            "Condition": {
-                "StringNotEquals": {"aws:SourceVpc": vpc_id},
-                "Null": {"aws:SourceIp": "true"},
-            },
-        },
     ]
+    if vpc_id:
+        statements.append(
+            {
+                "Sid": "DenyNonAgentVpc",
+                "Effect": "Deny",
+                "Action": "*",
+                "Resource": "*",
+                "Condition": {
+                    "StringNotEquals": {"aws:SourceVpc": vpc_id},
+                    "Null": {"aws:SourceIp": "true"},
+                },
+            }
+        )
     return json.dumps({"Version": "2012-10-17", "Statement": statements})
 
 
