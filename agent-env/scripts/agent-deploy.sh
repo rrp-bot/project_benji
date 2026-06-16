@@ -313,6 +313,20 @@ Environments:
   env-destroy <id>     Destroy an environment
   env-refresh <id>     Refresh STS credentials
 
+Credential injection (agent-mint-credentials.py):
+  Injection method is determined by which target arguments are given:
+
+  --env-id ID          Inject via ECS Exec into the benji agent container
+  --ssh-host USER@HOST SCP credentials onto a remote VM (authorized key, no password)
+  --sandbox-name NAME  Run `openshell sandbox upload` into the named sandbox
+                       (locally if no --ssh-host, over SSH on the VM if combined)
+
+  These compose freely:
+    --env-id                          ECS Exec only
+    --ssh-host                        SCP only
+    --sandbox-name                    local openshell upload only
+    --ssh-host + --sandbox-name       SCP onto VM, then openshell upload from VM
+
 Status:
   status               Show infrastructure and environment status
 

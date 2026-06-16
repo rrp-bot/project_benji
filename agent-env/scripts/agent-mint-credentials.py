@@ -19,12 +19,28 @@ Usage:
     python3 agent-mint-credentials.py --env-id abc123 --config config/account_config.yaml
     python3 agent-mint-credentials.py --ip 1.2.3.4 --config config/account_config.yaml
     python3 agent-mint-credentials.py --ip 1.2.3.4 --config config/account_config.yaml --duration 3600
+
+    # SCP creds onto a remote VM (authorized key, no password):
+    python3 agent-mint-credentials.py --ip 1.2.3.4 --config config/account_config.yaml \\
+        --ssh-host ec2-user@my-host --ssh-key ~/.ssh/id_ed25519
+
+    # Upload into an OpenShell sandbox locally (openshell must be installed locally):
+    python3 agent-mint-credentials.py --ip 1.2.3.4 --config config/account_config.yaml \\
+        --sandbox-name my-sandbox --sandbox-dir /sandbox/.aws
+
+    # SCP onto VM then upload into sandbox from the VM over SSH:
+    python3 agent-mint-credentials.py --ip 1.2.3.4 --config config/account_config.yaml \\
+        --ssh-host ec2-user@my-host --ssh-key ~/.ssh/id_ed25519 \\
+        --sandbox-name my-sandbox --sandbox-dir /sandbox/.aws
 """
 
 import argparse
 import base64
 import json
+import os
+import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime, timezone
 
@@ -298,25 +314,229 @@ print(json.dumps(output))
 '''
 
 
+_SSH_OPTS = [
+    "-o", "StrictHostKeyChecking=accept-new",
+    "-o", "BatchMode=yes",          # never prompt for password
+    "-o", "PasswordAuthentication=no",
+    "-o", "ConnectTimeout=15",
+]
+
+
+def _ssh_inject_credentials(
+    creds_file: str,
+    profiles: list[str],
+    ssh_target: str,
+    ssh_key: str | None,
+    ssh_dest: str,
+) -> None:
+    """SCP minted credentials (real_credentials + config + cred-helper) into a
+    remote VM via SSH authorized-key auth (no password).
+
+    Files are written into a temporary local directory, then copied to
+    ``ssh_target:ssh_dest`` via ``scp``.  The remote directory is created with
+    ``ssh … mkdir -p`` first.
+
+    Args:
+        creds_file:  Raw INI credentials text (real_credentials content).
+        profiles:    List of profile names (used to build ~/.aws/config).
+        ssh_target:  ``user@host`` (or just ``host``) for the remote VM.
+        ssh_key:     Path to the private key file (e.g. ``~/.ssh/id_ed25519``).
+                     If None the SSH agent / default key is used.
+        ssh_dest:    Remote directory to write files into (e.g. ``/home/user/.aws``).
+    """
+    key_opts = ["-i", os.path.expanduser(ssh_key)] if ssh_key else []
+    base_ssh = ["ssh"] + _SSH_OPTS + key_opts
+    base_scp = ["scp"] + _SSH_OPTS + key_opts
+
+    # Ensure the remote directory exists.
+    print(f"Creating remote directory {ssh_target}:{ssh_dest} ...", file=sys.stderr)
+    subprocess.run(
+        base_ssh + [ssh_target, f"mkdir -p {ssh_dest}"],
+        check=True,
+    )
+
+    helper_remote_path = f"{ssh_dest}/cred-helper"
+    config_content = _generate_config(profiles, helper_remote_path)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        real_creds_path = os.path.join(tmp, "real_credentials")
+        config_path = os.path.join(tmp, "config")
+        helper_path = os.path.join(tmp, "cred-helper")
+
+        with open(real_creds_path, "w") as f:
+            f.write(creds_file)
+        os.chmod(real_creds_path, 0o600)
+
+        with open(config_path, "w") as f:
+            f.write(config_content)
+        os.chmod(config_path, 0o600)
+
+        with open(helper_path, "w") as f:
+            f.write(CRED_HELPER_SCRIPT)
+        os.chmod(helper_path, 0o755)
+
+        print(
+            f"SCP-ing credentials to {ssh_target}:{ssh_dest} ...",
+            file=sys.stderr,
+        )
+        subprocess.run(
+            base_scp + [
+                real_creds_path,
+                config_path,
+                helper_path,
+                f"{ssh_target}:{ssh_dest}/",
+            ],
+            check=True,
+        )
+
+    # Fix up permissions on the remote side.
+    subprocess.run(
+        base_ssh + [
+            ssh_target,
+            f"chmod 600 {ssh_dest}/real_credentials {ssh_dest}/config"
+            f" && chmod 755 {ssh_dest}/cred-helper",
+        ],
+        check=True,
+    )
+
+    print(
+        f"Credentials injected via SSH into {ssh_target}:{ssh_dest}",
+        file=sys.stderr,
+    )
+    print(f"  {ssh_dest}/real_credentials  — STS credentials (INI)", file=sys.stderr)
+    print(f"  {ssh_dest}/config            — AWS config with credential_process", file=sys.stderr)
+    print(f"  {ssh_dest}/cred-helper       — credential_process helper script", file=sys.stderr)
+
+
+def _sandbox_upload(
+    local_path: str,
+    sandbox_name: str,
+    sandbox_dir: str,
+    ssh_target: str | None = None,
+    ssh_key: str | None = None,
+) -> None:
+    """Run ``openshell sandbox upload`` to push a local directory into a named
+    OpenShell sandbox.
+
+    Uses the OpenShell CLI syntax:
+
+        openshell sandbox upload <NAME> <LOCAL_PATH> [DEST]
+
+    where:
+      - ``<NAME>``        is the sandbox name (``sandbox_name``)
+      - ``<LOCAL_PATH>``  is ``local_path`` — the directory containing the
+                          credential files to upload
+      - ``[DEST]``        is ``sandbox_dir`` — the absolute destination path
+                          inside the sandbox (e.g. ``/sandbox/.aws``)
+
+    When ``ssh_target`` is provided the command is run *on the remote VM* over
+    SSH (so OpenShell only needs to be installed/authenticated there, not
+    locally).  When ``ssh_target`` is omitted the command is run locally
+    (OpenShell must be installed and authenticated on the local machine).
+
+    Args:
+        local_path:    Path to the directory to upload.  When running remotely
+                       this is a path on the VM; when running locally it is a
+                       local filesystem path.
+        sandbox_name:  OpenShell sandbox name (not an internal ID).
+        sandbox_dir:   Absolute destination path inside the sandbox.
+        ssh_target:    Optional ``user@host`` of the remote VM.  If given, the
+                       upload command is executed over SSH.
+        ssh_key:       Path to SSH private key (only used when ssh_target is set).
+    """
+    cmd = ["openshell", "sandbox", "upload", sandbox_name, local_path, sandbox_dir]
+
+    if ssh_target:
+        key_opts = ["-i", os.path.expanduser(ssh_key)] if ssh_key else []
+        base_ssh = ["ssh"] + _SSH_OPTS + key_opts
+        remote_cmd = " ".join(cmd)
+        print(f"Running on {ssh_target}: {remote_cmd}", file=sys.stderr)
+        subprocess.run(base_ssh + [ssh_target, remote_cmd], check=True)
+    else:
+        print(f"Running locally: {' '.join(cmd)}", file=sys.stderr)
+        subprocess.run(cmd, check=True)
+
+    print(f"OpenShell sandbox upload complete.", file=sys.stderr)
+    print(f"  Sandbox:  {sandbox_name}", file=sys.stderr)
+    print(f"  Dest:     {sandbox_dir} (inside sandbox)", file=sys.stderr)
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Mint IP-bound STS credentials for agent environments"
+        description="Mint IP-bound STS credentials for agent environments",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Injection is determined by which target arguments are supplied:
+
+  --env-id                         → ECS Exec into the agent container (benji)
+  --ssh-host USER@HOST             → SCP credentials onto the remote VM
+  --sandbox-name NAME              → openshell sandbox upload (run locally)
+  --ssh-host USER@HOST \\
+    --sandbox-name NAME            → SCP onto VM, then openshell sandbox upload
+                                     run on the VM over SSH
+
+All three can be combined with --keep-alive to continuously refresh credentials.
+""",
     )
-    parser.add_argument("--env-id", help="Environment ID — discover egress IP and VPC from live infrastructure")
+    parser.add_argument("--env-id", help="Environment ID — discover egress IP and VPC from live infrastructure, and inject via ECS Exec")
     parser.add_argument("--mint-profile", help="AWS profile for STS assume-role (credential minting)")
-    parser.add_argument("--inject", action="store_true", help="Inject credentials into the agent container via ECS Exec (requires --env-id)")
     parser.add_argument("--ip", help="Egress IP (overrides egress_ip in config, ignored if --env-id is set)")
     parser.add_argument("--config", required=True, help="Path to YAML config file")
     parser.add_argument("--duration", type=int, help="STS session duration in seconds (overrides config)")
-    parser.add_argument("--output-dir", default="agent_aws", help="Output directory (default: agent_aws)")
+    parser.add_argument("--output-dir", default="agent_aws", help="Output directory for local credential files (default: agent_aws)")
     parser.add_argument("--cred-helper-path", help="Path to cred-helper in generated config (default: <output-dir>/cred-helper)")
     parser.add_argument("--keep-alive", action="store_true", help="Continuously re-mint credentials 5 minutes before expiry")
+
+    # SSH options
+    ssh_group = parser.add_argument_group(
+        "SSH",
+        "SCP minted credentials into a remote VM via SSH (authorized key, no password). "
+        "Also used as the transport for --sandbox-name when both are given.",
+    )
+    ssh_group.add_argument(
+        "--ssh-host",
+        metavar="USER@HOST",
+        help="Remote VM to SCP credentials into (e.g. ec2-user@1.2.3.4).",
+    )
+    ssh_group.add_argument(
+        "--ssh-key",
+        metavar="PATH",
+        help="Path to the SSH private key. Must be pre-authorized on the remote host "
+             "(no password prompt). Defaults to SSH agent / ~/.ssh/id_rsa.",
+    )
+    ssh_group.add_argument(
+        "--ssh-dest",
+        metavar="DIR",
+        default="/home/agent/.aws",
+        help="Remote directory to write credentials into (default: /home/agent/.aws).",
+    )
+
+    # OpenShell sandbox options
+    sb_group = parser.add_argument_group(
+        "OpenShell sandbox",
+        "Upload credentials into a named OpenShell sandbox via "
+        "`openshell sandbox upload`. Runs locally unless --ssh-host is also given, "
+        "in which case the upload command is executed on the remote VM over SSH.",
+    )
+    sb_group.add_argument(
+        "--sandbox-name",
+        metavar="NAME",
+        help="OpenShell sandbox name to upload into. Presence of this flag triggers "
+             "the sandbox upload step.",
+    )
+    sb_group.add_argument(
+        "--sandbox-dir",
+        metavar="DIR",
+        default="/sandbox/.aws",
+        help="Absolute destination path inside the sandbox (default: /sandbox/.aws).",
+    )
+
     args = parser.parse_args()
 
-    if args.inject and not args.env_id:
-        parser.error("--inject requires --env-id")
-    if args.keep_alive and not args.inject:
-        parser.error("--keep-alive requires --inject")
+    if args.keep_alive and not args.env_id:
+        parser.error("--keep-alive requires --env-id")
+    if args.env_id and (args.ssh_host or args.sandbox_name):
+        parser.error("--env-id (ECS Exec) is mutually exclusive with --ssh-host and --sandbox-name")
 
     env_session = boto3.Session()
 
@@ -338,11 +558,22 @@ def main():
             args.config, ip, vpc_id, args.mint_profile, args.duration
         )
 
-        if args.inject:
+        if args.env_id:
+            # ECS Exec injection into the benji agent container.
             _inject_credentials(env_session, cluster, args.env_id, creds_file, profiles)
-        else:
-            import os
 
+        if args.ssh_host:
+            # SCP credentials onto the remote VM.
+            _ssh_inject_credentials(
+                creds_file=creds_file,
+                profiles=profiles,
+                ssh_target=args.ssh_host,
+                ssh_key=args.ssh_key,
+                ssh_dest=args.ssh_dest,
+            )
+
+        if not args.env_id and not args.ssh_host:
+            # No remote target — write credentials to a local output directory.
             out_dir = args.output_dir
             os.makedirs(out_dir, exist_ok=True)
 
@@ -368,6 +599,18 @@ def main():
             print(f"  real_credentials  — STS credentials (INI)", file=sys.stderr)
             print(f"  config            — AWS config with credential_process", file=sys.stderr)
             print(f"  cred-helper       — credential_process helper script", file=sys.stderr)
+
+        if args.sandbox_name:
+            # OpenShell sandbox upload.
+            # Source path: remote ssh_dest if --ssh-host given, else local output dir.
+            local_path = args.ssh_dest if args.ssh_host else args.output_dir
+            _sandbox_upload(
+                local_path=local_path,
+                sandbox_name=args.sandbox_name,
+                sandbox_dir=args.sandbox_dir,
+                ssh_target=args.ssh_host if args.ssh_host else None,
+                ssh_key=args.ssh_key if args.ssh_host else None,
+            )
 
         if not args.keep_alive:
             break
