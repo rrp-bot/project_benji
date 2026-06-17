@@ -503,7 +503,7 @@ All three can be combined with --keep-alive to continuously refresh credentials.
     parser.add_argument("--duration", type=int, help="STS session duration in seconds (overrides config)")
     parser.add_argument("--output-dir", default="agent_aws", help="Output directory for local credential files (default: agent_aws)")
     parser.add_argument("--cred-helper-path", help="Path to cred-helper in generated config (default: <output-dir>/cred-helper)")
-    parser.add_argument("--keep-alive", action="store_true", help="Continuously re-mint credentials 5 minutes before expiry")
+    parser.add_argument("--keep-alive", action="store_true", help="Continuously re-mint and re-deliver credentials 5 minutes before expiry")
 
     # SSH options
     ssh_group = parser.add_argument_group(
@@ -551,8 +551,8 @@ All three can be combined with --keep-alive to continuously refresh credentials.
 
     args = parser.parse_args()
 
-    if args.keep_alive and not args.env_id:
-        parser.error("--keep-alive requires --env-id")
+    if args.keep_alive and not (args.env_id or args.ssh_host or args.sandbox_name):
+        parser.error("--keep-alive requires at least one delivery target: --env-id, --ssh-host, or --sandbox-name")
     if args.env_id and (args.ssh_host or args.sandbox_name):
         parser.error("--env-id (ECS Exec) is mutually exclusive with --ssh-host and --sandbox-name")
 
