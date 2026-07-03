@@ -363,6 +363,7 @@ def _ssh_inject_credentials(
     ssh_target: str,
     ssh_key: str | None,
     ssh_dest: str,
+    cred_helper_path: str | None = None,
 ) -> None:
     """SCP minted credentials (real_credentials + config + cred-helper) into a
     remote VM via SSH authorized-key auth (no password).
@@ -372,12 +373,16 @@ def _ssh_inject_credentials(
     ``ssh … mkdir -p`` first.
 
     Args:
-        creds_file:  Raw INI credentials text (real_credentials content).
-        profiles:    List of profile names (used to build ~/.aws/config).
-        ssh_target:  ``user@host`` (or just ``host``) for the remote VM.
-        ssh_key:     Path to the private key file (e.g. ``~/.ssh/id_ed25519``).
-                     If None the SSH agent / default key is used.
-        ssh_dest:    Remote directory to write files into (e.g. ``/home/user/.aws``).
+        creds_file:       Raw INI credentials text (real_credentials content).
+        profiles:         List of profile names (used to build ~/.aws/config).
+        ssh_target:       ``user@host`` (or just ``host``) for the remote VM.
+        ssh_key:          Path to the private key file (e.g. ``~/.ssh/id_ed25519``).
+                          If None the SSH agent / default key is used.
+        ssh_dest:         Remote directory to write files into (e.g. ``/home/user/.aws``).
+        cred_helper_path: Path to use for ``credential_process`` in the generated config.
+                          Defaults to ``{ssh_dest}/cred-helper``. Override when the files
+                          will be moved again after SCP (e.g. sandbox upload), so that
+                          ``credential_process`` points to the final location.
     """
     key_opts = ["-i", os.path.expanduser(ssh_key)] if ssh_key else []
     base_ssh = ["ssh"] + _SSH_OPTS + key_opts
@@ -390,7 +395,7 @@ def _ssh_inject_credentials(
         check=True,
     )
 
-    helper_remote_path = f"{ssh_dest}/cred-helper"
+    helper_remote_path = cred_helper_path or f"{ssh_dest}/cred-helper"
     config_content = _generate_config(profiles, helper_remote_path)
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -643,12 +648,18 @@ All three can be combined with --keep-alive to continuously refresh credentials.
 
         if args.ssh_host:
             # SCP credentials onto the remote VM.
+            # If a sandbox upload will follow, credential_process must point to
+            # the final sandbox location, not the intermediate ssh_dest on the VM.
+            cred_helper_path = (
+                f"{args.sandbox_dir}/cred-helper" if args.sandbox_name else None
+            )
             _ssh_inject_credentials(
                 creds_file=creds_file,
                 profiles=profiles,
                 ssh_target=args.ssh_host,
                 ssh_key=args.ssh_key,
                 ssh_dest=args.ssh_dest,
+                cred_helper_path=cred_helper_path,
             )
 
         if not args.env_id and not args.ssh_host:
@@ -656,8 +667,13 @@ All three can be combined with --keep-alive to continuously refresh credentials.
             out_dir = args.output_dir
             os.makedirs(out_dir, exist_ok=True)
 
+            # If a sandbox upload will follow, credential_process must point to
+            # the final sandbox location, not the local staging out_dir.
+            cred_helper_dir = (
+                args.sandbox_dir if args.sandbox_name else os.path.abspath(out_dir)
+            )
             helper_path = args.cred_helper_path or os.path.join(
-                os.path.abspath(out_dir), "cred-helper"
+                cred_helper_dir, "cred-helper"
             )
             config_content = _generate_config(profiles, helper_path)
 
