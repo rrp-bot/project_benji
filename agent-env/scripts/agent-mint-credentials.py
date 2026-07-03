@@ -667,8 +667,13 @@ All three can be combined with --keep-alive to continuously refresh credentials.
             out_dir = args.output_dir
             os.makedirs(out_dir, exist_ok=True)
 
+            # If a sandbox upload will follow, credential_process must point to
+            # the final sandbox location, not the local staging out_dir.
+            cred_helper_dir = (
+                args.sandbox_dir if args.sandbox_name else os.path.abspath(out_dir)
+            )
             helper_path = args.cred_helper_path or os.path.join(
-                os.path.abspath(out_dir), "cred-helper"
+                cred_helper_dir, "cred-helper"
             )
             config_content = _generate_config(profiles, helper_path)
 
