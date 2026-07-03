@@ -26,13 +26,13 @@ Usage:
 
     # Upload into an OpenShell sandbox locally (openshell must be installed locally):
     python3 agent-mint-credentials.py --ip 1.2.3.4 --config config/account_config.yaml \\
-        --sandbox-name my-sandbox --sandbox-dir /sandbox/.aws
+        --sandbox-name my-sandbox --sandbox-dir /sandbox
 
     # SCP onto VM then upload into sandbox from the VM over SSH
     # (egress IP auto-discovered from checkip.amazonaws.com):
     python3 agent-mint-credentials.py --config config/account_config.yaml \\
         --ssh-host ec2-user@my-host --ssh-key ~/.ssh/id_ed25519 \\
-        --sandbox-name my-sandbox --sandbox-dir /sandbox/.aws
+        --sandbox-name my-sandbox --sandbox-dir /sandbox
 """
 
 import argparse
@@ -76,7 +76,9 @@ def _discover_proxy_public_ip(session: boto3.Session, cluster: str, env_id: str)
         print(f"ERROR: No running proxy tasks for {env_id}", file=sys.stderr)
         sys.exit(1)
 
-    task_detail = ecs_client.describe_tasks(cluster=cluster, tasks=[tasks["taskArns"][0]])
+    task_detail = ecs_client.describe_tasks(
+        cluster=cluster, tasks=[tasks["taskArns"][0]]
+    )
     attachments = task_detail["tasks"][0].get("attachments", [])
 
     eni_id = None
@@ -107,7 +109,9 @@ def _discover_from_env(env_session: boto3.Session, env_id: str) -> tuple[str, st
 
     cluster = outputs.get("EcsClusterName")
     if not cluster:
-        print("ERROR: EcsClusterName not found in shared stack outputs", file=sys.stderr)
+        print(
+            "ERROR: EcsClusterName not found in shared stack outputs", file=sys.stderr
+        )
         sys.exit(1)
 
     vpc_id = outputs.get("VpcId")
@@ -130,7 +134,10 @@ def _discover_local_egress_ip() -> str:
         with urllib.request.urlopen(url, timeout=10) as resp:
             ip = resp.read().decode().strip()
     except Exception as exc:
-        print(f"ERROR: Could not determine local egress IP from {url}: {exc}", file=sys.stderr)
+        print(
+            f"ERROR: Could not determine local egress IP from {url}: {exc}",
+            file=sys.stderr,
+        )
         sys.exit(1)
     print(f"Discovered local egress IP: {ip}", file=sys.stderr)
     return ip
@@ -181,7 +188,10 @@ def _inject_credentials(
         interactive=True,
         command=f"/bin/bash -c '{cmd}'",
     )
-    print("Credentials injected (real_credentials + config + cred-helper).", file=sys.stderr)
+    print(
+        "Credentials injected (real_credentials + config + cred-helper).",
+        file=sys.stderr,
+    )
 
 
 def _build_restriction_policy(ip: str, vpc_id: str | None = None) -> str:
@@ -235,7 +245,10 @@ def mint_credentials(
     policy_json = _build_restriction_policy(ip, vpc_id)
 
     if mint_profile:
-        print(f"Using AWS profile '{mint_profile}' for credential minting", file=sys.stderr)
+        print(
+            f"Using AWS profile '{mint_profile}' for credential minting",
+            file=sys.stderr,
+        )
         mint_session = boto3.Session(profile_name=mint_profile)
     else:
         mint_session = boto3.Session()
@@ -333,10 +346,14 @@ print(json.dumps(output))
 
 
 _SSH_OPTS = [
-    "-o", "StrictHostKeyChecking=accept-new",
-    "-o", "BatchMode=yes",          # never prompt for password
-    "-o", "PasswordAuthentication=no",
-    "-o", "ConnectTimeout=15",
+    "-o",
+    "StrictHostKeyChecking=accept-new",
+    "-o",
+    "BatchMode=yes",  # never prompt for password
+    "-o",
+    "PasswordAuthentication=no",
+    "-o",
+    "ConnectTimeout=15",
 ]
 
 
@@ -398,7 +415,8 @@ def _ssh_inject_credentials(
             file=sys.stderr,
         )
         subprocess.run(
-            base_scp + [
+            base_scp
+            + [
                 real_creds_path,
                 config_path,
                 helper_path,
@@ -409,7 +427,8 @@ def _ssh_inject_credentials(
 
     # Fix up permissions on the remote side.
     subprocess.run(
-        base_ssh + [
+        base_ssh
+        + [
             ssh_target,
             f"chmod 600 {ssh_dest}/real_credentials {ssh_dest}/config"
             f" && chmod 755 {ssh_dest}/cred-helper",
@@ -422,8 +441,14 @@ def _ssh_inject_credentials(
         file=sys.stderr,
     )
     print(f"  {ssh_dest}/real_credentials  — STS credentials (INI)", file=sys.stderr)
-    print(f"  {ssh_dest}/config            — AWS config with credential_process", file=sys.stderr)
-    print(f"  {ssh_dest}/cred-helper       — credential_process helper script", file=sys.stderr)
+    print(
+        f"  {ssh_dest}/config            — AWS config with credential_process",
+        file=sys.stderr,
+    )
+    print(
+        f"  {ssh_dest}/cred-helper       — credential_process helper script",
+        file=sys.stderr,
+    )
 
 
 def _sandbox_upload(
@@ -496,14 +521,37 @@ Injection is determined by which target arguments are supplied:
 All three can be combined with --keep-alive to continuously refresh credentials.
 """,
     )
-    parser.add_argument("--env-id", help="Environment ID — discover egress IP and VPC from live infrastructure, and inject via ECS Exec")
-    parser.add_argument("--mint-profile", help="AWS profile for STS assume-role (credential minting)")
-    parser.add_argument("--ip", help="Egress IP (overrides egress_ip in config, ignored if --env-id is set)")
+    parser.add_argument(
+        "--env-id",
+        help="Environment ID — discover egress IP and VPC from live infrastructure, and inject via ECS Exec",
+    )
+    parser.add_argument(
+        "--mint-profile", help="AWS profile for STS assume-role (credential minting)"
+    )
+    parser.add_argument(
+        "--ip",
+        help="Egress IP (overrides egress_ip in config, ignored if --env-id is set)",
+    )
     parser.add_argument("--config", required=True, help="Path to YAML config file")
-    parser.add_argument("--duration", type=int, help="STS session duration in seconds (overrides config)")
-    parser.add_argument("--output-dir", default="agent_aws", help="Output directory for local credential files (default: agent_aws)")
-    parser.add_argument("--cred-helper-path", help="Path to cred-helper in generated config (default: <output-dir>/cred-helper)")
-    parser.add_argument("--keep-alive", action="store_true", help="Continuously re-mint and re-deliver credentials 5 minutes before expiry")
+    parser.add_argument(
+        "--duration",
+        type=int,
+        help="STS session duration in seconds (overrides config)",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default="/sandbox",
+        help="Output directory for local credential files (default: /sandbox)",
+    )
+    parser.add_argument(
+        "--cred-helper-path",
+        help="Path to cred-helper in generated config (default: <output-dir>/cred-helper)",
+    )
+    parser.add_argument(
+        "--keep-alive",
+        action="store_true",
+        help="Continuously re-mint and re-deliver credentials 5 minutes before expiry",
+    )
 
     # SSH options
     ssh_group = parser.add_argument_group(
@@ -520,7 +568,7 @@ All three can be combined with --keep-alive to continuously refresh credentials.
         "--ssh-key",
         metavar="PATH",
         help="Path to the SSH private key. Must be pre-authorized on the remote host "
-             "(no password prompt). Defaults to SSH agent / ~/.ssh/id_rsa.",
+        "(no password prompt). Defaults to SSH agent / ~/.ssh/id_rsa.",
     )
     ssh_group.add_argument(
         "--ssh-dest",
@@ -540,21 +588,25 @@ All three can be combined with --keep-alive to continuously refresh credentials.
         "--sandbox-name",
         metavar="NAME",
         help="OpenShell sandbox name to upload into. Presence of this flag triggers "
-             "the sandbox upload step.",
+        "the sandbox upload step.",
     )
     sb_group.add_argument(
         "--sandbox-dir",
         metavar="DIR",
-        default="/sandbox/.aws",
-        help="Absolute destination path inside the sandbox (default: /sandbox/.aws).",
+        default="/sandbox",
+        help="Absolute destination path inside the sandbox (default: /sandbox).",
     )
 
     args = parser.parse_args()
 
     if args.keep_alive and not (args.env_id or args.ssh_host or args.sandbox_name):
-        parser.error("--keep-alive requires at least one delivery target: --env-id, --ssh-host, or --sandbox-name")
+        parser.error(
+            "--keep-alive requires at least one delivery target: --env-id, --ssh-host, or --sandbox-name"
+        )
     if args.env_id and (args.ssh_host or args.sandbox_name):
-        parser.error("--env-id (ECS Exec) is mutually exclusive with --ssh-host and --sandbox-name")
+        parser.error(
+            "--env-id (ECS Exec) is mutually exclusive with --ssh-host and --sandbox-name"
+        )
 
     env_session = boto3.Session()
 
@@ -604,7 +656,9 @@ All three can be combined with --keep-alive to continuously refresh credentials.
             out_dir = args.output_dir
             os.makedirs(out_dir, exist_ok=True)
 
-            helper_path = args.cred_helper_path or os.path.join(out_dir, "cred-helper")
+            helper_path = args.cred_helper_path or os.path.join(
+                os.path.abspath(out_dir), "cred-helper"
+            )
             config_content = _generate_config(profiles, helper_path)
 
             creds_path = os.path.join(out_dir, "real_credentials")
@@ -624,8 +678,14 @@ All three can be combined with --keep-alive to continuously refresh credentials.
 
             print(f"Written to: {out_dir}/", file=sys.stderr)
             print(f"  real_credentials  — STS credentials (INI)", file=sys.stderr)
-            print(f"  config            — AWS config with credential_process", file=sys.stderr)
-            print(f"  cred-helper       — credential_process helper script", file=sys.stderr)
+            print(
+                f"  config            — AWS config with credential_process",
+                file=sys.stderr,
+            )
+            print(
+                f"  cred-helper       — credential_process helper script",
+                file=sys.stderr,
+            )
 
         if args.sandbox_name:
             # OpenShell sandbox upload.
@@ -642,10 +702,12 @@ All three can be combined with --keep-alive to continuously refresh credentials.
         if not args.keep_alive:
             break
 
-        if hasattr(earliest_expiry, 'timestamp'):
+        if hasattr(earliest_expiry, "timestamp"):
             expiry_ts = earliest_expiry.timestamp()
         else:
-            expiry_ts = datetime.fromisoformat(str(earliest_expiry).replace("Z", "+00:00")).timestamp()
+            expiry_ts = datetime.fromisoformat(
+                str(earliest_expiry).replace("Z", "+00:00")
+            ).timestamp()
 
         refresh_at = expiry_ts - 300
         now = datetime.now(timezone.utc).timestamp()
