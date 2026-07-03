@@ -598,8 +598,8 @@ All three can be combined with --keep-alive to continuously refresh credentials.
     sb_group.add_argument(
         "--sandbox-dir",
         metavar="DIR",
-        default="/sandbox",
-        help="Absolute destination path inside the sandbox (default: /sandbox).",
+        default="/sandbox/.aws",
+        help="Absolute destination path inside the sandbox (default: /sandbox/.aws).",
     )
 
     args = parser.parse_args()
@@ -651,7 +651,11 @@ All three can be combined with --keep-alive to continuously refresh credentials.
             # If a sandbox upload will follow, credential_process must point to
             # the final sandbox location, not the intermediate ssh_dest on the VM.
             cred_helper_path = (
-                f"{args.sandbox_dir}/cred-helper" if args.sandbox_name else None
+                os.path.join(
+                    args.sandbox_dir, os.path.basename(args.ssh_dest), "cred-helper"
+                )
+                if args.sandbox_name
+                else None
             )
             _ssh_inject_credentials(
                 creds_file=creds_file,
