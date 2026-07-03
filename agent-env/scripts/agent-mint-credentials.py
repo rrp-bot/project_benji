@@ -19,6 +19,13 @@ Usage:
     python3 agent-mint-credentials.py --env-id abc123 --config config/account_config.yaml
     python3 agent-mint-credentials.py --ip 1.2.3.4 --config config/account_config.yaml
     python3 agent-mint-credentials.py --ip 1.2.3.4 --config config/account_config.yaml --duration 3600
+
+    # Write to /sandbox (default) — files go to /sandbox/{real_credentials,config,cred-helper}
+    # Copy to ~/.aws afterward:  cp /sandbox/{real_credentials,config,cred-helper} ~/.aws/
+
+    # If files will be copied to ~/.aws, pass --install-dir so credential_process paths are correct:
+    python3 agent-mint-credentials.py --ip 1.2.3.4 --config config/account_config.yaml \\
+        --output-dir /sandbox --install-dir ~/.aws
 """
 
 import argparse
@@ -58,7 +65,9 @@ def _discover_proxy_public_ip(session: boto3.Session, cluster: str, env_id: str)
         print(f"ERROR: No running proxy tasks for {env_id}", file=sys.stderr)
         sys.exit(1)
 
-    task_detail = ecs_client.describe_tasks(cluster=cluster, tasks=[tasks["taskArns"][0]])
+    task_detail = ecs_client.describe_tasks(
+        cluster=cluster, tasks=[tasks["taskArns"][0]]
+    )
     attachments = task_detail["tasks"][0].get("attachments", [])
 
     eni_id = None
@@ -89,7 +98,9 @@ def _discover_from_env(env_session: boto3.Session, env_id: str) -> tuple[str, st
 
     cluster = outputs.get("EcsClusterName")
     if not cluster:
-        print("ERROR: EcsClusterName not found in shared stack outputs", file=sys.stderr)
+        print(
+            "ERROR: EcsClusterName not found in shared stack outputs", file=sys.stderr
+        )
         sys.exit(1)
 
     vpc_id = outputs.get("VpcId")
@@ -150,7 +161,10 @@ def _inject_credentials(
         interactive=True,
         command=f"/bin/bash -c '{cmd}'",
     )
-    print("Credentials injected (real_credentials + config + cred-helper).", file=sys.stderr)
+    print(
+        "Credentials injected (real_credentials + config + cred-helper).",
+        file=sys.stderr,
+    )
 
 
 def _build_restriction_policy(ip: str, vpc_id: str | None = None) -> str:
@@ -201,7 +215,10 @@ def mint_credentials(
     policy_json = _build_restriction_policy(ip, vpc_id)
 
     if mint_profile:
-        print(f"Using AWS profile '{mint_profile}' for credential minting", file=sys.stderr)
+        print(
+            f"Using AWS profile '{mint_profile}' for credential minting",
+            file=sys.stderr,
+        )
         mint_session = boto3.Session(profile_name=mint_profile)
     else:
         mint_session = boto3.Session()
@@ -302,15 +319,44 @@ def main():
     parser = argparse.ArgumentParser(
         description="Mint IP-bound STS credentials for agent environments"
     )
-    parser.add_argument("--env-id", help="Environment ID — discover egress IP and VPC from live infrastructure")
-    parser.add_argument("--mint-profile", help="AWS profile for STS assume-role (credential minting)")
-    parser.add_argument("--inject", action="store_true", help="Inject credentials into the agent container via ECS Exec (requires --env-id)")
-    parser.add_argument("--ip", help="Egress IP (overrides egress_ip in config, ignored if --env-id is set)")
+    parser.add_argument(
+        "--env-id",
+        help="Environment ID — discover egress IP and VPC from live infrastructure",
+    )
+    parser.add_argument(
+        "--mint-profile", help="AWS profile for STS assume-role (credential minting)"
+    )
+    parser.add_argument(
+        "--inject",
+        action="store_true",
+        help="Inject credentials into the agent container via ECS Exec (requires --env-id)",
+    )
+    parser.add_argument(
+        "--ip",
+        help="Egress IP (overrides egress_ip in config, ignored if --env-id is set)",
+    )
     parser.add_argument("--config", required=True, help="Path to YAML config file")
-    parser.add_argument("--duration", type=int, help="STS session duration in seconds (overrides config)")
-    parser.add_argument("--output-dir", default="agent_aws", help="Output directory (default: agent_aws)")
-    parser.add_argument("--cred-helper-path", help="Path to cred-helper in generated config (default: <output-dir>/cred-helper)")
-    parser.add_argument("--keep-alive", action="store_true", help="Continuously re-mint credentials 5 minutes before expiry")
+    parser.add_argument(
+        "--duration",
+        type=int,
+        help="STS session duration in seconds (overrides config)",
+    )
+    parser.add_argument(
+        "--output-dir", default="/sandbox", help="Output directory (default: /sandbox)"
+    )
+    parser.add_argument(
+        "--install-dir",
+        help="Directory where files will live after copying (used for credential_process path in config, default: same as --output-dir)",
+    )
+    parser.add_argument(
+        "--cred-helper-path",
+        help="Absolute path to cred-helper for credential_process in config (overrides --install-dir)",
+    )
+    parser.add_argument(
+        "--keep-alive",
+        action="store_true",
+        help="Continuously re-mint credentials 5 minutes before expiry",
+    )
     args = parser.parse_args()
 
     if args.inject and not args.env_id:
@@ -346,7 +392,12 @@ def main():
             out_dir = args.output_dir
             os.makedirs(out_dir, exist_ok=True)
 
-            helper_path = args.cred_helper_path or os.path.join(out_dir, "cred-helper")
+            # credential_process needs the path where cred-helper will actually live
+            # (may differ from out_dir if files are copied to e.g. ~/.aws afterward)
+            install_dir = args.install_dir or out_dir
+            helper_path = args.cred_helper_path or os.path.join(
+                os.path.abspath(install_dir), "cred-helper"
+            )
             config_content = _generate_config(profiles, helper_path)
 
             creds_path = os.path.join(out_dir, "real_credentials")
@@ -366,16 +417,29 @@ def main():
 
             print(f"Written to: {out_dir}/", file=sys.stderr)
             print(f"  real_credentials  — STS credentials (INI)", file=sys.stderr)
-            print(f"  config            — AWS config with credential_process", file=sys.stderr)
-            print(f"  cred-helper       — credential_process helper script", file=sys.stderr)
+            print(
+                f"  config            — AWS config with credential_process",
+                file=sys.stderr,
+            )
+            print(
+                f"  cred-helper       — credential_process helper script",
+                file=sys.stderr,
+            )
+            if install_dir != os.path.abspath(out_dir):
+                print(
+                    f"  (credential_process paths written for install location: {install_dir})",
+                    file=sys.stderr,
+                )
 
         if not args.keep_alive:
             break
 
-        if hasattr(earliest_expiry, 'timestamp'):
+        if hasattr(earliest_expiry, "timestamp"):
             expiry_ts = earliest_expiry.timestamp()
         else:
-            expiry_ts = datetime.fromisoformat(str(earliest_expiry).replace("Z", "+00:00")).timestamp()
+            expiry_ts = datetime.fromisoformat(
+                str(earliest_expiry).replace("Z", "+00:00")
+            ).timestamp()
 
         refresh_at = expiry_ts - 300
         now = datetime.now(timezone.utc).timestamp()
